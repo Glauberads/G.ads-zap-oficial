@@ -1,0 +1,550 @@
+#!/bin/bash
+
+GREEN='\033[1;32m'
+BLUE='\033[1;34m'
+WHITE='\033[1;37m'
+RED='\033[1;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ARQUIVO_VARIAVEIS="${SCRIPT_DIR}/VARIAVEIS_INSTALACAO"
+
+ARCH=$(uname -m)
+UBUNTU_VERSION=$(lsb_release -sr 2>/dev/null || echo "0")
+ip_atual=$(curl -s http://checkip.amazonaws.com 2>/dev/null)
+default_apioficial_port=6000
+
+if [ "$EUID" -ne 0 ]; then
+  echo
+  printf "${WHITE} >> Este script precisa ser executado como root ${RED}ou com privilégios de superusuário${WHITE}.\n"
+  echo
+  exit 1
+fi
+
+trata_erro() {
+  printf "${RED}Erro encontrado na etapa: $1. Encerrando o script.${WHITE}\n"
+  exit 1
+}
+
+banner() {
+  clear
+  printf "${BLUE}"
+  echo "╔══════════════════════════════════════════════════════════════╗"
+  echo "║                    INSTALADOR API OFICIAL                    ║"
+  echo "║                         Multizap Flow                        ║"
+  echo "╚══════════════════════════════════════════════════════════════╝"
+  printf "${WHITE}\n\n"
+}
+
+reparo_nginx_critico() {
+  banner
+  printf "${YELLOW} >> Reparo rápido de configuração do Nginx...${WHITE}\n"
+
+  mkdir -p /etc/nginx/snippets
+  rm -f /etc/nginx/sites-enabled/-oficial 2>/dev/null
+  rm -f /etc/nginx/sites-available/-oficial 2>/dev/null
+  sed -i '/include \/etc\/nginx\/sites-enabled\/-oficial;/d' /etc/nginx/nginx.conf 2>/dev/null || true
+
+  nginx -t || {
+    printf "${RED} >> ERRO: Nginx ainda com configuração inválida após reparo.${WHITE}\n"
+    exit 1
+  }
+
+  printf "${GREEN} >> Nginx OK.${WHITE}\n"
+  sleep 2
+}
+
+carregar_variaveis() {
+  if [ -f "$ARQUIVO_VARIAVEIS" ]; then
+    # shellcheck disable=SC1090
+    source "$ARQUIVO_VARIAVEIS"
+  else
+    printf "${RED} >> ERRO: Arquivo VARIAVEIS_INSTALACAO não encontrado. Rode primeiro o instalar_primaria.${WHITE}\n"
+    exit 1
+  fi
+}
+
+solicitar_dados_apioficial() {
+  if [ -z "${subdominio_api_oficial}" ]; then
+    banner
+    printf "${WHITE} >> Subdomínio da API Oficial (ex: ofc.seusistema.com.br):\n\n"
+    read -r -p "> " subdominio_api_oficial
+    echo
+
+    subdominio_api_oficial=$(echo "${subdominio_api_oficial}" | sed 's|https://||g' | sed 's|http://||g' | cut -d'/' -f1)
+
+    if grep -q "^subdominio_api_oficial=" "$ARQUIVO_VARIAVEIS" 2>/dev/null; then
+      sed -i "s|^subdominio_api_oficial=.*|subdominio_api_oficial=${subdominio_api_oficial}|" "$ARQUIVO_VARIAVEIS"
+    else
+      echo "subdominio_api_oficial=${subdominio_api_oficial}" >> "$ARQUIVO_VARIAVEIS"
+    fi
+  fi
+}
+
+normalizar_variaveis() {
+  subdominio_backend=$(echo "${subdominio_backend}" | sed 's|https://||g' | sed 's|http://||g' | cut -d'/' -f1)
+  subdominio_frontend=$(echo "${subdominio_frontend}" | sed 's|https://||g' | sed 's|http://||g' | cut -d'/' -f1)
+  subdominio_api_oficial=$(echo "${subdominio_api_oficial}" | sed 's|https://||g' | sed 's|http://||g' | cut -d'/' -f1)
+}
+
+carregar_subdominio_backend() {
+  if [ -z "${subdominio_backend}" ]; then
+    local backend_env_path="/home/deploy/${empresa}/backend/.env"
+    if [ -f "${backend_env_path}" ]; then
+      local subdominio_backend_full
+      subdominio_backend_full=$(grep "^BACKEND_URL=" "${backend_env_path}" 2>/dev/null | cut -d '=' -f2-)
+      subdominio_backend=$(echo "${subdominio_backend_full}" | sed 's|https://||g' | sed 's|http://||g' | cut -d'/' -f1)
+      if ! grep -q "^subdominio_backend=" "$ARQUIVO_VARIAVEIS"; then
+        echo "subdominio_backend=${subdominio_backend}" >>"$ARQUIVO_VARIAVEIS"
+      fi
+    else
+      printf "${RED} >> ERRO: Não achou /backend/.env para identificar BACKEND_URL.${WHITE}\n"
+      exit 1
+    fi
+  fi
+}
+
+verificar_dns_apioficial() {
+  banner
+  printf "${WHITE} >> Verificando DNS da API Oficial...\n\n"
+  sleep 2
+
+  if ! command -v dig >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1
+    apt-get install -y dnsutils >/dev/null 2>&1
+  fi
+
+  local domain="${subdominio_api_oficial}"
+  local resolved_ip
+
+  if [ -z "${domain}" ]; then
+    printf "${RED} >> ERRO: Subdomínio da API Oficial está vazio.${WHITE}\n"
+    exit 1
+  fi
+
+  resolved_ip=$(dig +short "${domain}" @8.8.8.8)
+
+  if [ -z "${resolved_ip}" ]; then
+    printf "${YELLOW} >> AVISO: DNS de ${domain} ainda não retornou IP.\n"
+  elif [[ "${resolved_ip}" != "${ip_atual}"* ]]; then
+    printf "${YELLOW} >> AVISO: ${domain} -> ${resolved_ip} (diferente do IP atual ${ip_atual}).\n"
+  else
+    printf "${GREEN} >> OK: ${domain} aponta para ${resolved_ip}.${WHITE}\n"
+  fi
+
+  printf "\n${WHITE} >> Continuando mesmo assim (se SSL falhar, verifique DNS).${WHITE}\n"
+  sleep 3
+}
+
+criar_banco_apioficial() {
+  banner
+  printf "${WHITE} >> Criando banco separado da API Oficial...\n\n"
+
+  local banco_api_oficial="${empresa}_oficial"
+
+  sudo -u postgres psql <<EOF
+DO
+\$do\$
+BEGIN
+   IF NOT EXISTS (
+      SELECT FROM pg_catalog.pg_roles WHERE rolname = '${empresa}'
+   ) THEN
+      CREATE ROLE ${empresa} LOGIN SUPERUSER INHERIT CREATEDB CREATEROLE;
+      ALTER USER ${empresa} PASSWORD '${senha_deploy}';
+   ELSE
+      ALTER USER ${empresa} PASSWORD '${senha_deploy}';
+   END IF;
+END
+\$do\$;
+EOF
+
+  sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname = '${banco_api_oficial}'" | grep -q 1 || sudo -u postgres createdb "${banco_api_oficial}" -O "${empresa}" || trata_erro "criar_banco_apioficial"
+}
+
+configurar_nginx_apioficial() {
+  banner
+  printf "${WHITE} >> Configurando Nginx da API Oficial...\n\n"
+
+  local sites_available_path="/etc/nginx/sites-available/${empresa}-oficial"
+  local sites_enabled_link="/etc/nginx/sites-enabled/${empresa}-oficial"
+  local host="${subdominio_api_oficial}"
+
+  rm -f "${sites_enabled_link}" 2>/dev/null
+  rm -f "${sites_available_path}" 2>/dev/null
+
+  cat > "${sites_available_path}" <<EOF
+upstream oficial_api {
+    server 127.0.0.1:${default_apioficial_port};
+    keepalive 32;
+}
+
+server {
+    listen 80;
+    server_name ${host};
+    client_max_body_size 100M;
+
+    location = / {
+        return 200 "API ONLINE\n";
+        add_header Content-Type text/plain;
+    }
+
+    location = /robots.txt {
+        return 200 "User-agent: *\nDisallow: /\n";
+        add_header Content-Type text/plain;
+    }
+
+    location / {
+        proxy_pass http://oficial_api;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_cache_bypass \$http_upgrade;
+        proxy_buffering on;
+    }
+}
+EOF
+
+  ln -sf "${sites_available_path}" "${sites_enabled_link}"
+
+  nginx -t || trata_erro "nginx_api_oficial_http"
+  systemctl reload nginx
+
+  banner
+  printf "${WHITE} >> Emitindo SSL para https://${host}...\n\n"
+
+  if [ -z "${email_deploy}" ]; then
+    printf "${RED} >> ERRO: email_deploy não encontrado em VARIAVEIS_INSTALACAO.${WHITE}\n"
+    exit 1
+  fi
+
+  certbot -m "${email_deploy}" --nginx --agree-tos -n -d "${host}" || trata_erro "certbot_api_oficial"
+
+  cat > "${sites_available_path}" <<EOF
+upstream oficial_api {
+    server 127.0.0.1:${default_apioficial_port};
+    keepalive 32;
+}
+
+server {
+    listen 80;
+    server_name ${host};
+    client_max_body_size 100M;
+
+    location = / {
+        return 200 "API ONLINE\n";
+        add_header Content-Type text/plain;
+    }
+
+    location = /robots.txt {
+        return 200 "User-agent: *\nDisallow: /\n";
+        add_header Content-Type text/plain;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name ${host};
+    client_max_body_size 100M;
+
+    ssl_certificate /etc/letsencrypt/live/${host}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${host}/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    location = / {
+        return 200 "API ONLINE\n";
+        add_header Content-Type text/plain;
+    }
+
+    location = /robots.txt {
+        return 200 "User-agent: *\nDisallow: /\n";
+        add_header Content-Type text/plain;
+    }
+
+    location / {
+        proxy_pass http://oficial_api;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_cache_bypass \$http_upgrade;
+        proxy_buffering on;
+    }
+}
+EOF
+
+  nginx -t || trata_erro "nginx_api_oficial_final"
+  systemctl reload nginx
+}
+
+configurar_env_apioficial() {
+  banner
+  printf "${WHITE} >> Configurando arquivo .env da API Oficial...\n\n"
+
+  local backend_env_path="/home/deploy/${empresa}/backend/.env"
+  local jwt_refresh_secret_backend
+  local backend_url_full
+  local api_oficial_dir="/home/deploy/${empresa}/api_oficial"
+  local banco_api_oficial="${empresa}_oficial"
+
+  jwt_refresh_secret_backend=$(grep "^JWT_REFRESH_SECRET=" "${backend_env_path}" 2>/dev/null | cut -d '=' -f2-)
+  backend_url_full=$(grep "^BACKEND_URL=" "${backend_env_path}" 2>/dev/null | cut -d '=' -f2-)
+
+  if [ -z "${jwt_refresh_secret_backend}" ] || [ -z "${backend_url_full}" ]; then
+    printf "${RED} >> ERRO: Não conseguiu ler JWT_REFRESH_SECRET ou BACKEND_URL do backend.${WHITE}\n"
+    exit 1
+  fi
+
+  [ -d "${api_oficial_dir}" ] || trata_erro "pasta_api_oficial"
+
+  mkdir -p "${api_oficial_dir}"
+  chown -R deploy:deploy "${api_oficial_dir}"
+
+  cat > "${api_oficial_dir}/.env" <<EOF
+DATABASE_LINK=postgresql://${empresa}:${senha_deploy}@localhost:5432/${banco_api_oficial}?schema=public
+DATABASE_URL=localhost
+DATABASE_PORT=5432
+DATABASE_USER=${empresa}
+DATABASE_PASSWORD=${senha_deploy}
+DATABASE_NAME=${banco_api_oficial}
+
+TOKEN_ADMIN=whaticket
+URL_BACKEND_MULT100=${backend_url_full}
+JWT_REFRESH_SECRET=${jwt_refresh_secret_backend}
+
+REDIS_URI=redis://:${senha_deploy}@127.0.0.1:6379
+PORT=${default_apioficial_port}
+URL_API_OFICIAL=${subdominio_api_oficial}
+
+NAME_ADMIN=SetupAutomatizado
+EMAIL_ADMIN=admin@admin.com
+PASSWORD_ADMIN=123456
+EOF
+
+  chown deploy:deploy "${api_oficial_dir}/.env"
+}
+
+garantir_pm2() {
+  banner
+  printf "${WHITE} >> Verificando PM2 do deploy...\n\n"
+
+  local PM2_BIN=""
+
+  if [ -x /usr/bin/pm2 ]; then
+    PM2_BIN="/usr/bin/pm2"
+  elif [ -x /usr/local/bin/pm2 ]; then
+    PM2_BIN="/usr/local/bin/pm2"
+  else
+    export PATH=/usr/local/bin:/usr/bin:/bin:$PATH
+    npm install -g pm2 --no-fund --no-audit || trata_erro "instalar_pm2_global"
+    if command -v pm2 >/dev/null 2>&1; then
+      PM2_BIN="$(command -v pm2)"
+      ln -sf "$PM2_BIN" /usr/bin/pm2 2>/dev/null || true
+      ln -sf "$PM2_BIN" /usr/local/bin/pm2 2>/dev/null || true
+    fi
+  fi
+
+  [ -x /usr/bin/pm2 ] || [ -x /usr/local/bin/pm2 ] || trata_erro "pm2_nao_encontrado"
+
+  mkdir -p /home/deploy/.pm2
+  chown -R deploy:deploy /home/deploy/.pm2
+  chmod -R 755 /home/deploy/.pm2
+
+  sudo -u deploy bash -lc "
+    export HOME=/home/deploy
+    export PATH=/usr/local/bin:/usr/bin:/bin:\$PATH
+    export PM2_HOME=/home/deploy/.pm2
+    pm2 -v >/dev/null 2>&1
+  " || trata_erro "pm2_deploy"
+
+  printf "${GREEN} >> PM2 OK.${WHITE}\n"
+  sleep 1
+}
+
+instalar_api_oficial_node() {
+  banner
+  printf "${WHITE} >> Instalando dependências e subindo API Oficial...\n\n"
+
+  local api_oficial_dir="/home/deploy/${empresa}/api_oficial"
+
+  chown -R deploy:deploy "${api_oficial_dir}"
+
+  sudo -u deploy bash -lc "
+    export HOME=/home/deploy
+    export PATH=/usr/local/bin:/usr/bin:/bin:\$PATH
+    export PM2_HOME=/home/deploy/.pm2
+
+    cd '${api_oficial_dir}'
+
+    mkdir -p '${api_oficial_dir}/public'
+
+    rm -rf node_modules package-lock.json 2>/dev/null || true
+    npm install --force
+    npx prisma generate
+    npm run build || true
+
+    [ -f dist/main.js ] || exit 1
+
+    npx prisma migrate deploy
+    npx prisma generate || true
+
+    pm2 delete api_oficial 2>/dev/null || true
+    pm2 start dist/main.js --name 'api_oficial' --update-env
+    pm2 save
+    pm2 list
+
+    sleep 3
+    code=\$(curl -s -o /dev/null -w \"%{http_code}\" \"http://127.0.0.1:${default_apioficial_port}/\" || true)
+    echo \"HTTP local: \$code\"
+    echo \"\$code\" | grep -Eq \"200|401|404\" || exit 1
+  " || trata_erro "instalar_api_oficial_node"
+}
+
+configurar_permissoes_midia_oficial() {
+  banner
+  printf "${WHITE} >> Ajustando permissões da mídia da API Oficial...\n\n"
+
+  local public_dir="/home/deploy/${empresa}/api_oficial/public"
+
+  mkdir -p "${public_dir}"
+  chown -R deploy:deploy "${public_dir}"
+
+  if ! command -v setfacl >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y acl >/dev/null 2>&1 || true
+  fi
+
+  chmod o+rx /home/deploy || true
+  chmod o+rx "/home/deploy/${empresa}" || true
+  chmod o+rx "/home/deploy/${empresa}/api_oficial" || true
+  chmod o+rx "${public_dir}" || true
+
+  find "${public_dir}" -type d -exec chmod 755 {} \; 2>/dev/null || true
+  find "${public_dir}" -type f -exec chmod 644 {} \; 2>/dev/null || true
+
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:www-data:rx /home/deploy || true
+    setfacl -m u:www-data:rx "/home/deploy/${empresa}" || true
+    setfacl -m u:www-data:rx "/home/deploy/${empresa}/api_oficial" || true
+    setfacl -R -m u:www-data:rx "${public_dir}" || true
+    setfacl -dR -m u:www-data:rx "${public_dir}" || true
+  fi
+}
+
+configurar_nginx_public_midia_backend() {
+  banner
+  printf "${WHITE} >> Ajustando Nginx do backend para servir /official-public/...\n\n"
+
+  local backend_site="/etc/nginx/sites-available/${empresa}-backend"
+  local location_block='
+    location ^~ /official-public/ {
+        alias /home/deploy/'"${empresa}"'/api_oficial/public/;
+        try_files $uri =404;
+        access_log off;
+        expires 7d;
+        add_header Cache-Control "public, max-age=604800";
+    }
+'
+
+  if [ ! -f "${backend_site}" ]; then
+    printf "${YELLOW} >> AVISO: arquivo ${backend_site} não encontrado. Pulando ajuste do backend nginx.${WHITE}\n"
+    return
+  fi
+
+  if ! grep -q "location \^~ /official-public/" "${backend_site}"; then
+    awk -v block="$location_block" '
+      BEGIN { inserted=0 }
+      /location \/ \{/ && inserted==0 {
+        print block
+        inserted=1
+      }
+      { print }
+    ' "${backend_site}" > "${backend_site}.tmp" && mv "${backend_site}.tmp" "${backend_site}"
+  fi
+
+  nginx -t || trata_erro "nginx_public_midia_backend"
+  systemctl reload nginx
+}
+
+atualizar_env_backend() {
+  banner
+  printf "${WHITE} >> Ajustando .env do backend para usar a API Oficial...\n\n"
+
+  local backend_env_path="/home/deploy/${empresa}/backend/.env"
+  local new_url="URL_API_OFICIAL=https://${subdominio_api_oficial}"
+  local new_media="OFFICIAL_MEDIA_URL=https://${subdominio_backend}"
+
+  if grep -q "^USE_WHATSAPP_OFICIAL=" "${backend_env_path}"; then
+    sed -i 's|^USE_WHATSAPP_OFICIAL=.*|USE_WHATSAPP_OFICIAL=true|' "${backend_env_path}"
+  else
+    echo "USE_WHATSAPP_OFICIAL=true" >> "${backend_env_path}"
+  fi
+
+  if grep -q "^URL_API_OFICIAL=" "${backend_env_path}"; then
+    sed -i "s|^URL_API_OFICIAL=.*|${new_url}|" "${backend_env_path}"
+  else
+    echo "${new_url}" >> "${backend_env_path}"
+  fi
+
+  if grep -q "^OFFICIAL_MEDIA_URL=" "${backend_env_path}"; then
+    sed -i "s|^OFFICIAL_MEDIA_URL=.*|${new_media}|" "${backend_env_path}"
+  else
+    echo "${new_media}" >> "${backend_env_path}"
+  fi
+
+  sudo -u deploy bash -lc "
+    export HOME=/home/deploy
+    export PATH=/usr/local/bin:/usr/bin:/bin:\$PATH
+    export PM2_HOME=/home/deploy/.pm2
+    pm2 reload '${empresa}-backend' --update-env
+  " || trata_erro "reload_backend"
+}
+
+reiniciar_proxies() {
+  banner
+  printf "${WHITE} >> Reiniciando Nginx...\n\n"
+  if systemctl is-active --quiet nginx; then
+    systemctl restart nginx
+  fi
+}
+
+finalizar_api() {
+  banner
+  printf "${GREEN} >> Instalação da API Oficial concluída!${WHITE}\n\n"
+  printf "   ${WHITE}URL:  ${BLUE}https://${subdominio_api_oficial}${WHITE}\n"
+  printf "   ${WHITE}Porta interna: ${BLUE}${default_apioficial_port}${WHITE}\n"
+  printf "   ${WHITE}Banco: ${BLUE}${empresa}_oficial${WHITE}\n\n"
+}
+
+main() {
+  reparo_nginx_critico
+  carregar_variaveis
+  solicitar_dados_apioficial
+  normalizar_variaveis
+  carregar_subdominio_backend
+  verificar_dns_apioficial
+  criar_banco_apioficial
+  configurar_nginx_apioficial
+  configurar_env_apioficial
+  garantir_pm2
+  instalar_api_oficial_node
+  configurar_permissoes_midia_oficial
+  configurar_nginx_public_midia_backend
+  atualizar_env_backend
+  reiniciar_proxies
+  finalizar_api
+}
+
+main
